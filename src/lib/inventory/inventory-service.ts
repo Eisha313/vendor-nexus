@@ -1,326 +1,304 @@
-import { db } from '@/lib/db';
-import { products, inventory, inventoryAlerts, vendors } from '@/lib/db/schema';
-import { eq, and, lte, sql } from 'drizzle-orm';
+import { db } from '@/lib/db/schema';
+import { InventoryItem, LowStockAlert, StockUpdateResult } from '@/lib/types';
+import { NotFoundError, ConflictError, ValidationError } from '@/lib/errors';
 import { EventEmitter } from 'events';
 
-export interface InventoryItem {
-  productId: string;
-  vendorId: string;
-  sku: string;
-  quantity: number;
-  reservedQuantity: number;
-  lowStockThreshold: number;
-  lastUpdated: Date;
-}
+class InventoryService {
+  private eventEmitter: EventEmitter;
+  private updateLocks: Map<string, Promise<void>>;
 
-export interface StockUpdate {
-  productId: string;
-  vendorId: string;
-  quantityChange: number;
-  reason: 'sale' | 'restock' | 'adjustment' | 'return' | 'reservation';
-  referenceId?: string;
-}
-
-export interface LowStockAlert {
-  id: string;
-  productId: string;
-  vendorId: string;
-  productName: string;
-  currentQuantity: number;
-  threshold: number;
-  severity: 'warning' | 'critical' | 'out_of_stock';
-  createdAt: Date;
-  acknowledged: boolean;
-}
-
-class InventoryEventEmitter extends EventEmitter {
-  emitStockUpdate(data: { productId: string; vendorId: string; newQuantity: number }) {
-    this.emit('stockUpdate', data);
+  constructor() {
+    this.eventEmitter = new EventEmitter();
+    this.updateLocks = new Map();
   }
 
-  emitLowStockAlert(alert: LowStockAlert) {
-    this.emit('lowStockAlert', alert);
-  }
-
-  emitProductDeactivated(data: { productId: string; vendorId: string; reason: string }) {
-    this.emit('productDeactivated', data);
-  }
-}
-
-export const inventoryEvents = new InventoryEventEmitter();
-
-export class InventoryService {
-  private static instance: InventoryService;
-
-  static getInstance(): InventoryService {
-    if (!InventoryService.instance) {
-      InventoryService.instance = new InventoryService();
+  private async acquireLock(productId: string): Promise<() => void> {
+    // Wait for any existing lock on this product
+    const existingLock = this.updateLocks.get(productId);
+    if (existingLock) {
+      await existingLock;
     }
-    return InventoryService.instance;
-  }
 
-  async getInventory(productId: string, vendorId: string): Promise<InventoryItem | null> {
-    const result = await db
-      .select()
-      .from(inventory)
-      .where(and(eq(inventory.productId, productId), eq(inventory.vendorId, vendorId)))
-      .limit(1);
+    let releaseLock: () => void;
+    const lockPromise = new Promise<void>((resolve) => {
+      releaseLock = resolve;
+    });
 
-    if (result.length === 0) return null;
+    this.updateLocks.set(productId, lockPromise);
 
-    const item = result[0];
-    return {
-      productId: item.productId,
-      vendorId: item.vendorId,
-      sku: item.sku,
-      quantity: item.quantity,
-      reservedQuantity: item.reservedQuantity,
-      lowStockThreshold: item.lowStockThreshold,
-      lastUpdated: item.lastUpdated,
+    return () => {
+      this.updateLocks.delete(productId);
+      releaseLock!();
     };
   }
 
-  async getVendorInventory(vendorId: string): Promise<InventoryItem[]> {
-    const results = await db
-      .select()
-      .from(inventory)
-      .where(eq(inventory.vendorId, vendorId));
-
-    return results.map((item) => ({
-      productId: item.productId,
-      vendorId: item.vendorId,
-      sku: item.sku,
-      quantity: item.quantity,
-      reservedQuantity: item.reservedQuantity,
-      lowStockThreshold: item.lowStockThreshold,
-      lastUpdated: item.lastUpdated,
-    }));
-  }
-
-  async updateStock(update: StockUpdate): Promise<{ success: boolean; newQuantity: number; alerts?: LowStockAlert[] }> {
-    const currentInventory = await this.getInventory(update.productId, update.vendorId);
-
-    if (!currentInventory) {
-      throw new Error(`Inventory not found for product ${update.productId}`);
-    }
-
-    const newQuantity = currentInventory.quantity + update.quantityChange;
-
-    if (newQuantity < 0) {
-      throw new Error('Insufficient inventory');
-    }
-
-    await db
-      .update(inventory)
-      .set({
-        quantity: newQuantity,
-        lastUpdated: new Date(),
-      })
-      .where(and(eq(inventory.productId, update.productId), eq(inventory.vendorId, update.vendorId)));
-
-    // Log the inventory change
-    await this.logInventoryChange(update, currentInventory.quantity, newQuantity);
-
-    // Emit real-time update
-    inventoryEvents.emitStockUpdate({
-      productId: update.productId,
-      vendorId: update.vendorId,
-      newQuantity,
+  async getInventory(productId: string): Promise<InventoryItem> {
+    const item = await db.inventory.findUnique({
+      where: { productId },
+      include: {
+        product: true,
+        vendor: true,
+        reservations: {
+          where: {
+            expiresAt: { gt: new Date() },
+            status: 'active'
+          }
+        }
+      }
     });
 
-    // Check for low stock conditions
-    const alerts = await this.checkLowStockConditions(update.productId, update.vendorId, newQuantity, currentInventory.lowStockThreshold);
-
-    // Auto-deactivate if out of stock
-    if (newQuantity === 0) {
-      await this.deactivateProduct(update.productId, update.vendorId, 'out_of_stock');
+    if (!item) {
+      throw new NotFoundError(`Inventory not found for product: ${productId}`);
     }
 
-    return { success: true, newQuantity, alerts };
-  }
-
-  async reserveStock(productId: string, vendorId: string, quantity: number, orderId: string): Promise<boolean> {
-    const currentInventory = await this.getInventory(productId, vendorId);
-
-    if (!currentInventory) {
-      throw new Error(`Inventory not found for product ${productId}`);
-    }
-
-    const availableQuantity = currentInventory.quantity - currentInventory.reservedQuantity;
-
-    if (availableQuantity < quantity) {
-      return false;
-    }
-
-    await db
-      .update(inventory)
-      .set({
-        reservedQuantity: currentInventory.reservedQuantity + quantity,
-        lastUpdated: new Date(),
-      })
-      .where(and(eq(inventory.productId, productId), eq(inventory.vendorId, vendorId)));
-
-    await this.logInventoryChange(
-      {
-        productId,
-        vendorId,
-        quantityChange: 0,
-        reason: 'reservation',
-        referenceId: orderId,
-      },
-      currentInventory.quantity,
-      currentInventory.quantity
+    const reservedQuantity = item.reservations.reduce(
+      (sum, r) => sum + r.quantity,
+      0
     );
 
-    return true;
+    return {
+      ...item,
+      availableQuantity: Math.max(0, item.quantity - reservedQuantity),
+      reservedQuantity
+    };
   }
 
-  async commitReservation(productId: string, vendorId: string, quantity: number, orderId: string): Promise<void> {
-    const currentInventory = await this.getInventory(productId, vendorId);
-
-    if (!currentInventory) {
-      throw new Error(`Inventory not found for product ${productId}`);
-    }
-
-    await db
-      .update(inventory)
-      .set({
-        quantity: currentInventory.quantity - quantity,
-        reservedQuantity: Math.max(0, currentInventory.reservedQuantity - quantity),
-        lastUpdated: new Date(),
-      })
-      .where(and(eq(inventory.productId, productId), eq(inventory.vendorId, vendorId)));
-
-    await this.logInventoryChange(
-      {
-        productId,
-        vendorId,
-        quantityChange: -quantity,
-        reason: 'sale',
-        referenceId: orderId,
-      },
-      currentInventory.quantity,
-      currentInventory.quantity - quantity
-    );
-  }
-
-  async releaseReservation(productId: string, vendorId: string, quantity: number, orderId: string): Promise<void> {
-    const currentInventory = await this.getInventory(productId, vendorId);
-
-    if (!currentInventory) {
-      throw new Error(`Inventory not found for product ${productId}`);
-    }
-
-    await db
-      .update(inventory)
-      .set({
-        reservedQuantity: Math.max(0, currentInventory.reservedQuantity - quantity),
-        lastUpdated: new Date(),
-      })
-      .where(and(eq(inventory.productId, productId), eq(inventory.vendorId, vendorId)));
-  }
-
-  async getLowStockProducts(vendorId?: string): Promise<LowStockAlert[]> {
-    const query = db
-      .select({
-        productId: inventory.productId,
-        vendorId: inventory.vendorId,
-        quantity: inventory.quantity,
-        threshold: inventory.lowStockThreshold,
-        productName: products.name,
-      })
-      .from(inventory)
-      .innerJoin(products, eq(inventory.productId, products.id))
-      .where(lte(inventory.quantity, inventory.lowStockThreshold));
-
-    const results = vendorId
-      ? await query.where(and(lte(inventory.quantity, inventory.lowStockThreshold), eq(inventory.vendorId, vendorId)))
-      : await query;
-
-    return results.map((item) => ({
-      id: `alert_${item.productId}_${Date.now()}`,
-      productId: item.productId,
-      vendorId: item.vendorId,
-      productName: item.productName,
-      currentQuantity: item.quantity,
-      threshold: item.threshold,
-      severity: this.calculateAlertSeverity(item.quantity, item.threshold),
-      createdAt: new Date(),
-      acknowledged: false,
-    }));
-  }
-
-  async setLowStockThreshold(productId: string, vendorId: string, threshold: number): Promise<void> {
-    await db
-      .update(inventory)
-      .set({ lowStockThreshold: threshold })
-      .where(and(eq(inventory.productId, productId), eq(inventory.vendorId, vendorId)));
-  }
-
-  private async checkLowStockConditions(
+  async updateStock(
     productId: string,
-    vendorId: string,
-    quantity: number,
-    threshold: number
-  ): Promise<LowStockAlert[]> {
-    const alerts: LowStockAlert[] = [];
+    quantityChange: number,
+    reason: string,
+    expectedVersion?: number
+  ): Promise<StockUpdateResult> {
+    const releaseLock = await this.acquireLock(productId);
 
-    if (quantity <= threshold) {
-      const product = await db.select().from(products).where(eq(products.id, productId)).limit(1);
+    try {
+      const currentInventory = await db.inventory.findUnique({
+        where: { productId },
+        include: { product: true }
+      });
 
-      if (product.length > 0) {
-        const alert: LowStockAlert = {
-          id: `alert_${productId}_${Date.now()}`,
-          productId,
-          vendorId,
-          productName: product[0].name,
-          currentQuantity: quantity,
-          threshold,
-          severity: this.calculateAlertSeverity(quantity, threshold),
-          createdAt: new Date(),
-          acknowledged: false,
-        };
+      if (!currentInventory) {
+        throw new NotFoundError(`Inventory not found for product: ${productId}`);
+      }
 
-        await db.insert(inventoryAlerts).values({
-          id: alert.id,
-          productId: alert.productId,
-          vendorId: alert.vendorId,
-          alertType: alert.severity,
-          message: `Low stock alert: ${alert.productName} has ${quantity} units remaining`,
-          createdAt: alert.createdAt,
+      // Optimistic locking check
+      if (expectedVersion !== undefined && currentInventory.version !== expectedVersion) {
+        throw new ConflictError(
+          `Inventory was modified by another process. Expected version ${expectedVersion}, current version ${currentInventory.version}`
+        );
+      }
+
+      const newQuantity = currentInventory.quantity + quantityChange;
+
+      if (newQuantity < 0) {
+        throw new ValidationError(
+          `Insufficient stock. Current: ${currentInventory.quantity}, Requested change: ${quantityChange}`
+        );
+      }
+
+      const updated = await db.$transaction(async (tx) => {
+        // Update inventory with version increment
+        const updatedInventory = await tx.inventory.update({
+          where: { 
+            productId,
+            version: currentInventory.version // Ensure no concurrent modification
+          },
+          data: {
+            quantity: newQuantity,
+            version: { increment: 1 },
+            lastUpdatedAt: new Date()
+          }
         });
 
-        inventoryEvents.emitLowStockAlert(alert);
-        alerts.push(alert);
+        if (!updatedInventory) {
+          throw new ConflictError('Concurrent modification detected');
+        }
+
+        // Log the stock movement
+        await tx.stockMovement.create({
+          data: {
+            productId,
+            quantityChange,
+            reason,
+            previousQuantity: currentInventory.quantity,
+            newQuantity,
+            createdAt: new Date()
+          }
+        });
+
+        return updatedInventory;
+      });
+
+      // Check for low stock alert after successful update
+      await this.checkLowStockAlert(productId, newQuantity, currentInventory.lowStockThreshold);
+
+      // Auto-deactivate listing if out of stock
+      if (newQuantity === 0 && currentInventory.autoDeactivate) {
+        await this.deactivateListing(productId);
       }
+
+      return {
+        success: true,
+        productId,
+        previousQuantity: currentInventory.quantity,
+        newQuantity,
+        version: updated.version
+      };
+    } catch (error) {
+      // Re-throw known errors
+      if (error instanceof NotFoundError || 
+          error instanceof ConflictError || 
+          error instanceof ValidationError) {
+        throw error;
+      }
+      
+      // Wrap unknown errors
+      throw new Error(`Failed to update stock for ${productId}: ${error instanceof Error ? error.message : 'Unknown error'}`);
+    } finally {
+      releaseLock();
+    }
+  }
+
+  async reserveStock(
+    productId: string,
+    quantity: number,
+    orderId: string,
+    expirationMinutes: number = 15
+  ): Promise<{ reservationId: string; expiresAt: Date }> {
+    const releaseLock = await this.acquireLock(productId);
+
+    try {
+      const inventory = await this.getInventory(productId);
+
+      if (inventory.availableQuantity < quantity) {
+        throw new ValidationError(
+          `Insufficient available stock. Available: ${inventory.availableQuantity}, Requested: ${quantity}`
+        );
+      }
+
+      const expiresAt = new Date(Date.now() + expirationMinutes * 60 * 1000);
+
+      const reservation = await db.stockReservation.create({
+        data: {
+          productId,
+          orderId,
+          quantity,
+          status: 'active',
+          expiresAt,
+          createdAt: new Date()
+        }
+      });
+
+      return {
+        reservationId: reservation.id,
+        expiresAt
+      };
+    } finally {
+      releaseLock();
+    }
+  }
+
+  async confirmReservation(reservationId: string): Promise<void> {
+    const reservation = await db.stockReservation.findUnique({
+      where: { id: reservationId }
+    });
+
+    if (!reservation) {
+      throw new NotFoundError(`Reservation not found: ${reservationId}`);
     }
 
-    return alerts;
+    if (reservation.status !== 'active') {
+      throw new ValidationError(`Reservation is not active: ${reservation.status}`);
+    }
+
+    if (reservation.expiresAt < new Date()) {
+      throw new ValidationError('Reservation has expired');
+    }
+
+    await db.$transaction(async (tx) => {
+      await tx.stockReservation.update({
+        where: { id: reservationId },
+        data: { status: 'confirmed' }
+      });
+
+      // Decrement actual stock
+      await tx.inventory.update({
+        where: { productId: reservation.productId },
+        data: {
+          quantity: { decrement: reservation.quantity },
+          version: { increment: 1 }
+        }
+      });
+    });
   }
 
-  private calculateAlertSeverity(quantity: number, threshold: number): 'warning' | 'critical' | 'out_of_stock' {
-    if (quantity === 0) return 'out_of_stock';
-    if (quantity <= threshold * 0.25) return 'critical';
-    return 'warning';
+  async releaseReservation(reservationId: string): Promise<void> {
+    const reservation = await db.stockReservation.findUnique({
+      where: { id: reservationId }
+    });
+
+    if (!reservation) {
+      // Silently ignore - reservation may have already been released or expired
+      return;
+    }
+
+    if (reservation.status === 'released') {
+      return; // Already released
+    }
+
+    await db.stockReservation.update({
+      where: { id: reservationId },
+      data: { status: 'released' }
+    });
   }
 
-  private async deactivateProduct(productId: string, vendorId: string, reason: string): Promise<void> {
-    await db
-      .update(products)
-      .set({ status: 'inactive', updatedAt: new Date() })
-      .where(and(eq(products.id, productId), eq(products.vendorId, vendorId)));
-
-    inventoryEvents.emitProductDeactivated({ productId, vendorId, reason });
-  }
-
-  private async logInventoryChange(
-    update: StockUpdate,
-    previousQuantity: number,
-    newQuantity: number
+  private async checkLowStockAlert(
+    productId: string,
+    currentQuantity: number,
+    threshold: number
   ): Promise<void> {
-    // In a real implementation, this would log to an inventory_logs table
-    console.log(`[Inventory] Product ${update.productId}: ${previousQuantity} -> ${newQuantity} (${update.reason})`);
+    if (currentQuantity <= threshold) {
+      const alert: LowStockAlert = {
+        productId,
+        currentQuantity,
+        threshold,
+        alertedAt: new Date()
+      };
+
+      this.eventEmitter.emit('lowStock', alert);
+
+      await db.alert.create({
+        data: {
+          type: 'LOW_STOCK',
+          productId,
+          data: JSON.stringify(alert),
+          createdAt: new Date(),
+          acknowledged: false
+        }
+      });
+    }
+  }
+
+  private async deactivateListing(productId: string): Promise<void> {
+    await db.product.update({
+      where: { id: productId },
+      data: {
+        status: 'OUT_OF_STOCK',
+        deactivatedAt: new Date(),
+        deactivationReason: 'AUTO_OUT_OF_STOCK'
+      }
+    });
+
+    this.eventEmitter.emit('listingDeactivated', { productId, reason: 'out_of_stock' });
+  }
+
+  onLowStock(callback: (alert: LowStockAlert) => void): void {
+    this.eventEmitter.on('lowStock', callback);
+  }
+
+  onListingDeactivated(callback: (data: { productId: string; reason: string }) => void): void {
+    this.eventEmitter.on('listingDeactivated', callback);
   }
 }
 
-export const inventoryService = InventoryService.getInstance();
+export const inventoryService = new InventoryService();
